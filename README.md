@@ -12,7 +12,7 @@ ELR Sorter lets you:
 
 1. Load your **ELR Master Registry** Excel workbook.
 2. Load a **batch of mixed images** (drag-and-drop or file picker).
-3. **Auto-match** images whose filenames already contain an ELR ID.
+3. **Smart auto-match** images using visual similarity plus registry metadata.
 4. **Manually assign** remaining images by clicking a registry row, then an image card.
 5. **Export** clean CSV files and a patched workbook for direct use in your pipeline.
 
@@ -67,15 +67,18 @@ Click **🖼️ Load Images** or drag-and-drop files onto the drop zone.
 - Duplicate files (same name + size) are skipped automatically.
 - Each image shows its dimensions, orientation, and any detected ELR ID.
 
-### 3. Auto-Assign
+### 3. Smart Auto-Assign
 
-Click **⚡ Auto-Assign**.
+Click **⚡ Smart Auto-Assign**.
 
-- The app scans each image filename for an ELR ID pattern:
-  - `ELR_001`, `ELR-001`, `ELR 001`, `elr001`, etc.
-- If a match is found for an available (unmapped) registry row, it is assigned automatically.
-- A status message tells you how many images were matched.
-- Unmatched images are left untouched for manual review.
+- The app first attempts a quick filename pass (`ELR_001`, `ELR-001`, `ELR 001`, etc.).
+- Then it runs visual similarity matching in the browser using a CLIP model.
+- Visual matching compares each image against ELR row context (Asset Title, App Section, Collection, Usage Objective, Visual Direction, Art Notes).
+- Use the **Visual Confidence** slider to control strictness (higher = stricter, lower = more aggressive matching).
+- A status message shows progress and final counts for visual vs filename matches.
+- Unmatched images are left for manual review.
+
+> First run note: the visual model is downloaded once by your browser cache, so first run can take longer.
 
 ### 4. Manual Assignment
 

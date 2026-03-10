@@ -15,6 +15,9 @@ const state = {
   assignments: {},           // { elrId: imageName }
   selectedElrId: null,       // currently selected ELR row
   searchQuery: '',           // current search string
+  visualModelPromise: null,  // lazy-loaded CLIP pipeline promise
+  isAutoAssigning: false,    // guard to avoid concurrent auto-assign runs
+  visualThreshold: 0.24,     // confidence floor for visual matching
 };
 
 // ELR IDs from 001–077
@@ -33,6 +36,8 @@ const exportRenameBtn  = $('export-rename-btn');
 const exportWbBtn      = $('export-workbook-btn');
 const statusMsg        = $('status-message');
 const searchInput      = $('search-input');
+const visualThresholdInput = $('visual-threshold-input');
+const visualThresholdValue = $('visual-threshold-value');
 const registryTbody    = $('registry-tbody');
 const galleryGrid      = $('gallery-grid');
 const dropZone         = $('drop-zone');
@@ -50,6 +55,16 @@ const galleryCount     = $('gallery-count');
 function setStatus(msg, type = '') {
   statusMsg.textContent = msg;
   statusMsg.className = type;
+}
+
+function readVisualThreshold() {
+  const raw = parseFloat(visualThresholdInput.value);
+  if (Number.isNaN(raw)) return state.visualThreshold;
+  return Math.max(0.15, Math.min(0.55, raw));
+}
+
+function updateVisualThresholdLabel() {
+  visualThresholdValue.textContent = state.visualThreshold.toFixed(2);
 }
 
 // ── ELR Detection ───────────────────────────────────────
@@ -374,12 +389,57 @@ clearAssignBtn.addEventListener('click', () => {
 // ── Auto-Assign ──────────────────────────────────────────
 autoAssignBtn.addEventListener('click', autoAssign);
 
-function autoAssign() {
+async function autoAssign() {
   if (!state.registry.length) { setStatus('Load a workbook first.', 'error'); return; }
   if (!state.images.length)   { setStatus('Load images first.', 'error'); return; }
+  if (state.isAutoAssigning)  { setStatus('Auto-assign already running…', 'info'); return; }
 
+  state.isAutoAssigning = true;
+  updateButtonStates();
+
+  try {
+    state.visualThreshold = readVisualThreshold();
+    updateVisualThresholdLabel();
+
+    let matchedByFilename = 0;
+    let matchedByVisual = 0;
+
+    setStatus('Auto-assign step 1/2: filename match pass…', 'info');
+    matchedByFilename = autoAssignByFilename();
+
+    const remainingRows = state.registry.filter(r => !state.assignments[r.elrId]);
+    const remainingImages = state.images.filter(img => !getImageAssignment(img.name));
+
+    if (remainingRows.length && remainingImages.length) {
+      setStatus('Auto-assign step 2/2: loading visual matching model…', 'info');
+      matchedByVisual = await autoAssignByVisualSimilarity(remainingRows, remainingImages);
+    }
+
+    renderRegistry();
+    renderGallery();
+    renderSelectedInfo();
+    updateStats();
+
+    const total = matchedByFilename + matchedByVisual;
+    if (total > 0) {
+      setStatus(
+        `Auto-assign complete: ${total} mapped (${matchedByVisual} visual, ${matchedByFilename} filename, threshold ${state.visualThreshold.toFixed(2)}).`,
+        'success'
+      );
+    } else {
+      setStatus('Auto-assign complete: no confident visual or filename matches found.', 'info');
+    }
+  } catch (err) {
+    console.error(err);
+    setStatus('Auto-assign failed: ' + err.message, 'error');
+  } finally {
+    state.isAutoAssigning = false;
+    updateButtonStates();
+  }
+}
+
+function autoAssignByFilename() {
   let matched = 0;
-
   for (const img of state.images) {
     if (!img.detectedElrId) continue;
     const elrId = img.detectedElrId;
@@ -394,18 +454,98 @@ function autoAssign() {
     state.assignments[elrId] = img.name;
     matched++;
   }
+  return matched;
+}
 
-  renderRegistry();
-  renderGallery();
-  renderSelectedInfo();
-  updateStats();
-  updateButtonStates();
+async function autoAssignByVisualSimilarity(candidateRows, candidateImages) {
+  const classifier = await getVisualClassifier();
 
-  if (matched > 0) {
-    setStatus(`Auto-assign complete: ${matched} image(s) matched automatically.`, 'success');
-  } else {
-    setStatus('Auto-assign complete: no new matches found based on filenames.', 'info');
+  const rowsWithPrompts = candidateRows.map(row => ({
+    row,
+    prompt: buildVisualPrompt(row),
+  }));
+
+  const proposals = [];
+  let completed = 0;
+
+  for (const img of candidateImages) {
+    completed++;
+    setStatus(
+      `Visual match in progress: scoring image ${completed}/${candidateImages.length}…`,
+      'info'
+    );
+
+    const labels = rowsWithPrompts.map(x => x.prompt);
+    const raw = await classifier(img.previewUrl, labels, {
+      topk: Math.min(5, labels.length),
+    });
+
+    const predictions = Array.isArray(raw) ? raw : [];
+    for (const pred of predictions) {
+      if (!pred || typeof pred.label !== 'string' || typeof pred.score !== 'number') continue;
+      const match = rowsWithPrompts.find(x => x.prompt === pred.label);
+      if (!match) continue;
+      proposals.push({
+        elrId: match.row.elrId,
+        imageName: img.name,
+        score: pred.score,
+      });
+    }
   }
+
+  // Global greedy assignment with confidence floor, enforcing one-to-one mapping.
+  proposals.sort((a, b) => b.score - a.score);
+  const usedRows = new Set();
+  const usedImages = new Set();
+  let matched = 0;
+
+  for (const p of proposals) {
+    if (p.score < state.visualThreshold) continue;
+    if (state.assignments[p.elrId]) continue;
+    if (getImageAssignment(p.imageName)) continue;
+    if (usedRows.has(p.elrId) || usedImages.has(p.imageName)) continue;
+
+    state.assignments[p.elrId] = p.imageName;
+    usedRows.add(p.elrId);
+    usedImages.add(p.imageName);
+    matched++;
+  }
+
+  return matched;
+}
+
+function buildVisualPrompt(row) {
+  const tokens = [
+    row.assetTitle,
+    row.appSection,
+    row.collection,
+    row.usageObjective,
+    row.visualDirection,
+    row.artNotes,
+  ].filter(Boolean);
+
+  if (!tokens.length) {
+    return 'fantasy game interface artwork';
+  }
+
+  const compact = tokens.join(', ').replace(/\s+/g, ' ').trim();
+  // Keep prompts concise for CLIP while still descriptive.
+  return compact.slice(0, 220);
+}
+
+async function getVisualClassifier() {
+  if (state.visualModelPromise) return state.visualModelPromise;
+
+  if (!window.transformers || typeof window.transformers.pipeline !== 'function') {
+    throw new Error('Visual model library not loaded. Check your internet connection and reload.');
+  }
+
+  state.visualModelPromise = window.transformers.pipeline(
+    'zero-shot-image-classification',
+    'Xenova/clip-vit-base-patch32'
+  );
+
+  return state.visualModelPromise;
 }
 
 // ── Render Registry ──────────────────────────────────────
@@ -599,8 +739,9 @@ function updateButtonStates() {
   const hasRegistry = state.registry.length > 0;
   const hasImages   = state.images.length > 0;
   const hasAny      = Object.keys(state.assignments).length > 0;
+  const busy        = state.isAutoAssigning;
 
-  autoAssignBtn.disabled    = !(hasRegistry && hasImages);
+  autoAssignBtn.disabled    = busy || !(hasRegistry && hasImages);
   clearAssignBtn.disabled   = !hasAny;
   exportMappingBtn.disabled = !hasRegistry;
   exportRenameBtn.disabled  = !hasRegistry;
@@ -611,6 +752,11 @@ function updateButtonStates() {
 searchInput.addEventListener('input', () => {
   state.searchQuery = searchInput.value;
   renderRegistry();
+});
+
+visualThresholdInput.addEventListener('input', () => {
+  state.visualThreshold = readVisualThreshold();
+  updateVisualThresholdLabel();
 });
 
 // ── Exports ──────────────────────────────────────────────
@@ -827,3 +973,4 @@ function escHtml(str) {
 // ── Init ─────────────────────────────────────────────────
 updateStats();
 updateButtonStates();
+updateVisualThresholdLabel();

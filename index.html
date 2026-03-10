@@ -24,8 +24,8 @@
       </label>
       <input type="file" id="images-input" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden />
 
-      <button class="btn btn-accent" id="auto-assign-btn" disabled title="Auto-assign images based on filename ELR detection">
-        ⚡ Auto-Assign
+      <button class="btn btn-accent" id="auto-assign-btn" disabled title="Auto-assign using visual similarity and ELR metadata">
+        ⚡ Smart Auto-Assign
       </button>
       <button class="btn btn-ghost" id="clear-assignments-btn" disabled title="Remove all assignments">
         🗑️ Clear All
@@ -64,6 +64,20 @@
     <div class="stat-item unmapped">
       <span class="stat-label">Unmapped</span>
       <span class="stat-value" id="stat-unmapped">0</span>
+    </div>
+    <div class="threshold-area" title="Higher confidence is stricter; lower confidence maps more aggressively.">
+      <label for="visual-threshold-input" class="threshold-label">Visual Confidence</label>
+      <input
+        type="range"
+        id="visual-threshold-input"
+        class="threshold-input"
+        min="0.15"
+        max="0.55"
+        step="0.01"
+        value="0.24"
+        aria-label="Visual auto-assign confidence threshold"
+      />
+      <span class="threshold-value" id="visual-threshold-value">0.24</span>
     </div>
     <div class="search-area">
       <input
@@ -137,6 +151,7 @@
   </main>
 
   <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2/dist/transformers.min.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
