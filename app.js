@@ -714,13 +714,11 @@ function exportPatchedWorkbook() {
     const colFinalUrl     = findColumnIndex(headers, COL_MAP.finalUrl);
     const colNotes        = findColumnIndex(headers, COL_MAP.notes);
 
-    // Clone workbook data (SheetJS works on the same object; we rebuild)
-    const cloneWb = XLSX.utils.book_new();
-    // Copy all sheets
-    for (const sheetName of wb.SheetNames) {
-      const cloneWs = Object.assign({}, wb.Sheets[sheetName]);
-      XLSX.utils.book_append_sheet(cloneWb, cloneWs, sheetName);
-    }
+    // Deep-clone workbook via write/read so export edits never mutate in-memory source data.
+    const cloneWb = XLSX.read(
+      XLSX.write(wb, { bookType: 'xlsx', type: 'array' }),
+      { type: 'array' }
+    );
     const targetWs = cloneWb.Sheets[SHEET_NAME];
 
     // Apply patches
