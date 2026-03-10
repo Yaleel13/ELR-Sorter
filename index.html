@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ELR Sorter</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="app-header">
+    <div class="header-title">
+      <span class="logo">⬡</span>
+      <h1>ELR Sorter</h1>
+      <span class="subtitle">Elaria Visual Asset Organizer</span>
+    </div>
+    <div class="header-actions">
+      <label class="btn btn-primary" for="workbook-input" title="Load ELR Master Registry workbook">
+        📂 Load Workbook
+      </label>
+      <input type="file" id="workbook-input" accept=".xlsx,.xls" hidden />
+
+      <label class="btn btn-secondary" for="images-input" title="Load images to assign">
+        🖼️ Load Images
+      </label>
+      <input type="file" id="images-input" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden />
+
+      <button class="btn btn-accent" id="auto-assign-btn" disabled title="Auto-assign images based on filename ELR detection">
+        ⚡ Auto-Assign
+      </button>
+      <button class="btn btn-ghost" id="clear-assignments-btn" disabled title="Remove all assignments">
+        🗑️ Clear All
+      </button>
+    </div>
+    <div class="header-exports">
+      <button class="btn btn-export" id="export-mapping-btn" disabled title="Export ELR-to-image mapping as CSV">
+        📊 Export Mapping
+      </button>
+      <button class="btn btn-export" id="export-rename-btn" disabled title="Export rename instructions as CSV">
+        ✏️ Export Rename
+      </button>
+      <button class="btn btn-export" id="export-workbook-btn" disabled title="Export patched workbook with assignments applied">
+        📥 Export Workbook
+      </button>
+    </div>
+  </header>
+
+  <div class="status-bar" id="status-bar">
+    <span id="status-message">Ready — load a workbook to get started.</span>
+  </div>
+
+  <div class="stats-bar" id="stats-bar">
+    <div class="stat-item">
+      <span class="stat-label">ELR Rows</span>
+      <span class="stat-value" id="stat-total">0</span>
+    </div>
+    <div class="stat-item">
+      <span class="stat-label">Images</span>
+      <span class="stat-value" id="stat-images">0</span>
+    </div>
+    <div class="stat-item mapped">
+      <span class="stat-label">Mapped</span>
+      <span class="stat-value" id="stat-mapped">0</span>
+    </div>
+    <div class="stat-item unmapped">
+      <span class="stat-label">Unmapped</span>
+      <span class="stat-value" id="stat-unmapped">0</span>
+    </div>
+    <div class="search-area">
+      <input
+        type="text"
+        id="search-input"
+        class="search-input"
+        placeholder="Search ELR ID, title, folder, image…"
+        aria-label="Search registry"
+      />
+    </div>
+  </div>
+
+  <main class="app-main">
+    <!-- LEFT PANEL: Registry -->
+    <section class="panel panel-registry" aria-label="ELR Registry">
+      <div class="panel-header">
+        <h2>Registry <span class="panel-count" id="registry-count"></span></h2>
+      </div>
+
+      <div class="selected-info" id="selected-info" hidden>
+        <div class="selected-info-header">
+          <span class="selected-badge">Selected</span>
+          <button class="btn-icon" id="deselect-btn" title="Deselect row">✕</button>
+        </div>
+        <div class="selected-info-grid" id="selected-info-grid"></div>
+      </div>
+
+      <div class="table-wrapper">
+        <table class="registry-table" id="registry-table">
+          <thead>
+            <tr>
+              <th>ELR ID</th>
+              <th>Asset Title</th>
+              <th>App Section</th>
+              <th>Storage Folder</th>
+              <th>Assigned Image</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody id="registry-tbody">
+            <tr class="empty-row">
+              <td colspan="6">Load a workbook to see registry rows.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- RIGHT PANEL: Image Gallery -->
+    <section class="panel panel-gallery" aria-label="Image Gallery">
+      <div class="panel-header">
+        <h2>Images <span class="panel-count" id="gallery-count"></span></h2>
+      </div>
+
+      <div
+        id="drop-zone"
+        class="drop-zone"
+        role="region"
+        aria-label="Drag and drop images here"
+      >
+        <div class="drop-zone-inner" id="drop-zone-inner">
+          <span class="drop-icon">⬆</span>
+          <p>Drag &amp; drop images here</p>
+          <p class="drop-sub">or use <strong>Load Images</strong> above</p>
+          <p class="drop-sub">Supports PNG, JPG, WEBP, GIF</p>
+        </div>
+      </div>
+
+      <div class="gallery-grid" id="gallery-grid"></div>
+    </section>
+  </main>
+
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
