@@ -169,6 +169,14 @@ html, body {
 }
 .btn-export:not(:disabled):hover { background: #0e2720; border-color: var(--green); }
 
+.btn-export-zip {
+  background: var(--bg);
+  color: var(--orange);
+  border-color: #5c3d14;
+  font-size: 12px;
+}
+.btn-export-zip:not(:disabled):hover { background: #261a08; border-color: var(--orange); }
+
 .btn-sm {
   padding: 4px 9px;
   font-size: 11.5px;

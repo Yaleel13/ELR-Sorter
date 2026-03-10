@@ -33,13 +33,19 @@
     </div>
     <div class="header-exports">
       <button class="btn btn-export" id="export-mapping-btn" disabled title="Export ELR-to-image mapping as CSV">
-        📊 Export Mapping
+        📊 Mapping CSV
       </button>
-      <button class="btn btn-export" id="export-rename-btn" disabled title="Export rename instructions as CSV">
-        ✏️ Export Rename
+      <button class="btn btn-export" id="export-rename-btn" disabled title="Export rename manifest as CSV">
+        ✏️ Rename CSV
       </button>
       <button class="btn btn-export" id="export-workbook-btn" disabled title="Export patched workbook with assignments applied">
-        📥 Export Workbook
+        📥 Workbook
+      </button>
+      <button class="btn btn-export-zip" id="export-assets-zip-btn" disabled title="Download ZIP of renamed asset files in folders">
+        📦 Assets ZIP
+      </button>
+      <button class="btn btn-export-zip" id="export-package-zip-btn" disabled title="Download complete package: renamed assets + CSVs + patched workbook">
+        🎁 Complete Package
       </button>
     </div>
   </header>
@@ -151,7 +157,7 @@
   </main>
 
   <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2/dist/transformers.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

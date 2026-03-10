@@ -8,16 +8,19 @@
 
 // ── State ────────────────────────────────────────────────
 const state = {
-  workbookRaw: null,         // original XLSX workbook object
-  workbookFileName: '',      // original workbook filename
-  registry: [],              // parsed ELR registry rows (objects)
-  images: [],                // uploaded image objects
-  assignments: {},           // { elrId: imageName }
-  selectedElrId: null,       // currently selected ELR row
-  searchQuery: '',           // current search string
-  visualModelPromise: null,  // lazy-loaded CLIP pipeline promise
-  isAutoAssigning: false,    // guard to avoid concurrent auto-assign runs
-  visualThreshold: 0.24,     // confidence floor for visual matching
+  workbookRaw: null,           // original XLSX workbook object
+  workbookFileName: '',        // original workbook filename
+  registry: [],                // parsed ELR registry rows (objects)
+  images: [],                  // uploaded image objects  { name, size, ext, width, height, orientation, previewUrl, detectedElrId, file }
+  assignments: {},             // { elrId: imageName }
+  assignmentMeta: {},          // { elrId: { source, score, confidence, reason } }
+  selectedElrId: null,         // currently selected ELR row
+  searchQuery: '',             // current search string
+  transformersApiPromise: null,// lazy-loaded Transformers.js API
+  visualModelPromise: null,    // lazy-loaded CLIP pipeline promise
+  isAutoAssigning: false,      // guard to avoid concurrent auto-assign runs
+  isExporting: false,          // guard to avoid concurrent export runs
+  visualThreshold: 0.24,       // confidence floor for visual matching
 };
 
 // ELR IDs from 001–077
@@ -34,6 +37,8 @@ const clearAssignBtn   = $('clear-assignments-btn');
 const exportMappingBtn = $('export-mapping-btn');
 const exportRenameBtn  = $('export-rename-btn');
 const exportWbBtn      = $('export-workbook-btn');
+const exportAssetsZipBtn  = $('export-assets-zip-btn');
+const exportPackageZipBtn = $('export-package-zip-btn');
 const statusMsg        = $('status-message');
 const searchInput      = $('search-input');
 const visualThresholdInput = $('visual-threshold-input');
@@ -67,58 +72,127 @@ function updateVisualThresholdLabel() {
   visualThresholdValue.textContent = state.visualThreshold.toFixed(2);
 }
 
+// ── Safe Filename / Folder Helpers ───────────────────────
+function sanitizeFilename(name) {
+  if (!name) return '';
+  return name
+    .replace(/[<>:"/\\|?*\x00-\x1f]/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/^\.+/, '_');
+}
+
+function sanitizeFolder(folder) {
+  if (!folder) return 'unfiled';
+  return folder
+    .replace(/\\/g, '/')
+    .replace(/[<>:"|?*\x00-\x1f]/g, '_')
+    .replace(/\/+/g, '/')
+    .replace(/^\/+|\/+$/g, '')
+    .trim() || 'unfiled';
+}
+
+function getTargetFilename(row, img) {
+  const ext = img ? img.ext : 'png';
+  let name = row.filename || '';
+  if (name) {
+    if (!/\.\w+$/.test(name)) {
+      name = name + '.' + ext;
+    }
+  } else {
+    const num = row.elrId.replace('ELR ', 'ELR_');
+    name = num + '.' + ext;
+  }
+  return sanitizeFilename(name);
+}
+
+function getTargetFolder(row) {
+  return sanitizeFolder(row.storageFolder);
+}
+
+function getTargetPath(row, img) {
+  return getTargetFolder(row) + '/' + getTargetFilename(row, img);
+}
+
+// ── Assignment Source Tracking ────────────────────────────
+function setAssignmentMeta(elrId, source, score, reason) {
+  var confidence = 'unknown';
+  if (source === 'manual') {
+    confidence = 'approved manually';
+  } else if (source === 'filename-detected') {
+    confidence = 'filename match';
+  } else if (source === 'visual-analysis' && typeof score === 'number') {
+    if (score >= 0.4) confidence = 'high';
+    else if (score >= 0.3) confidence = 'medium';
+    else confidence = 'low';
+  }
+  state.assignmentMeta[elrId] = {
+    source: source,
+    score: typeof score === 'number' ? score : null,
+    confidence: confidence,
+    reason: reason || source,
+  };
+}
+
+function getAssignmentMeta(elrId) {
+  return state.assignmentMeta[elrId] || {
+    source: 'unknown',
+    score: null,
+    confidence: 'unknown',
+    reason: 'unknown',
+  };
+}
+
+function getAssignmentSourceLabel(meta) {
+  switch (meta.source) {
+    case 'filename-detected': return 'Mapped by ELR Sorter filename detection';
+    case 'visual-analysis':   return 'Matched by ELR Sorter visual analysis';
+    case 'manual':            return 'Matched manually after visual analysis';
+    default:                  return 'Mapped by ELR Sorter';
+  }
+}
+
 // ── ELR Detection ───────────────────────────────────────
-/**
- * Given a filename string, attempt to extract an ELR ID.
- * Supports: ELR_001, ELR-001, ELR 001, elr001, ELR001, etc.
- * Returns normalised "ELR 001" or null.
- */
 function detectElrFromFilename(filename) {
   if (!filename) return null;
-  const upper = filename.toUpperCase();
-  // Match ELR followed by optional separator and 1–3 digits
-  const match = upper.match(/ELR[\s_\-]?(\d{1,3})/);
+  var upper = filename.toUpperCase();
+  var match = upper.match(/ELR[\s_\-]?(\d{1,3})/);
   if (!match) return null;
-  const num = parseInt(match[1], 10);
+  var num = parseInt(match[1], 10);
   if (num < 1 || num > 77) return null;
   return 'ELR ' + String(num).padStart(3, '0');
 }
 
-/**
- * Normalise a raw value from the workbook to a valid ELR ID or null.
- */
 function normaliseElrId(raw) {
   if (raw == null || raw === '') return null;
-  const str = String(raw).trim().toUpperCase();
-  // Already in correct format
+  var str = String(raw).trim().toUpperCase();
   if (/^ELR \d{3}$/.test(str)) {
-    const num = parseInt(str.slice(4), 10);
+    var num = parseInt(str.slice(4), 10);
     return (num >= 1 && num <= 77) ? str : null;
   }
   return detectElrFromFilename(str);
 }
 
 // ── Workbook Loading ─────────────────────────────────────
-workbookInput.addEventListener('change', e => {
-  const file = e.target.files[0];
+workbookInput.addEventListener('change', function(e) {
+  var file = e.target.files[0];
   if (!file) return;
   loadWorkbook(file);
-  // Reset so same file can be re-loaded
   workbookInput.value = '';
 });
 
 function loadWorkbook(file) {
   setStatus('Reading workbook…', 'info');
-  const reader = new FileReader();
-  reader.onload = evt => {
+  var reader = new FileReader();
+  reader.onload = function(evt) {
     try {
-      const data = new Uint8Array(evt.target.result);
-      const wb = XLSX.read(data, { type: 'array' });
+      var data = new Uint8Array(evt.target.result);
+      var wb = XLSX.read(data, { type: 'array' });
 
-      const SHEET_NAME = 'ELR Master Registry';
+      var SHEET_NAME = 'ELR Master Registry';
       if (!wb.SheetNames.includes(SHEET_NAME)) {
         setStatus(
-          `Error: Sheet "${SHEET_NAME}" not found. Available sheets: ${wb.SheetNames.join(', ')}`,
+          'Error: Sheet "' + SHEET_NAME + '" not found. Available sheets: ' + wb.SheetNames.join(', '),
           'error'
         );
         return;
@@ -127,10 +201,10 @@ function loadWorkbook(file) {
       state.workbookRaw = wb;
       state.workbookFileName = file.name;
 
-      const sheet = wb.Sheets[SHEET_NAME];
-      const rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+      var sheet = wb.Sheets[SHEET_NAME];
+      var rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
 
-      const parsed = parseRegistryRows(rows);
+      var parsed = parseRegistryRows(rows);
       if (parsed.length === 0) {
         setStatus('Error: No valid ELR rows (ELR 001–077) found in the sheet.', 'error');
         return;
@@ -138,18 +212,19 @@ function loadWorkbook(file) {
 
       state.registry = parsed;
       state.assignments = {};
+      state.assignmentMeta = {};
       state.selectedElrId = null;
 
       renderRegistry();
       updateStats();
       updateButtonStates();
-      setStatus(`Workbook loaded: ${file.name} — ${parsed.length} ELR rows found.`, 'success');
+      setStatus('Workbook loaded: ' + file.name + ' — ' + parsed.length + ' ELR rows found.', 'success');
     } catch (err) {
       setStatus('Error reading workbook: ' + err.message, 'error');
       console.error(err);
     }
   };
-  reader.onerror = () => setStatus('Error: Could not read file.', 'error');
+  reader.onerror = function() { setStatus('Error: Could not read file.', 'error'); };
   reader.readAsArrayBuffer(file);
 }
 
@@ -183,20 +258,21 @@ const COL_MAP = {
 };
 
 function getCell(row, keys) {
-  for (const k of keys) {
-    if (row[k] != null && row[k] !== '') return String(row[k]).trim();
+  for (var i = 0; i < keys.length; i++) {
+    if (row[keys[i]] != null && row[keys[i]] !== '') return String(row[keys[i]]).trim();
   }
   return '';
 }
 
 function parseRegistryRows(rows) {
-  const parsed = [];
-  for (const row of rows) {
-    const elrId = normaliseElrId(getCell(row, COL_MAP.elrId));
+  var parsed = [];
+  for (var i = 0; i < rows.length; i++) {
+    var row = rows[i];
+    var elrId = normaliseElrId(getCell(row, COL_MAP.elrId));
     if (!elrId) continue;
 
     parsed.push({
-      elrId,
+      elrId:           elrId,
       seq:             getCell(row, COL_MAP.seq),
       assetCategory:   getCell(row, COL_MAP.assetCategory),
       collection:      getCell(row, COL_MAP.collection),
@@ -224,15 +300,14 @@ function parseRegistryRows(rows) {
     });
   }
 
-  // Sort by Seq ascending; fall back to ELR number
-  parsed.sort((a, b) => {
-    const seqA = parseInt(a.seq, 10);
-    const seqB = parseInt(b.seq, 10);
+  parsed.sort(function(a, b) {
+    var seqA = parseInt(a.seq, 10);
+    var seqB = parseInt(b.seq, 10);
     if (!isNaN(seqA) && !isNaN(seqB)) return seqA - seqB;
     if (!isNaN(seqA)) return -1;
     if (!isNaN(seqB)) return 1;
-    const numA = parseInt(a.elrId.slice(4), 10);
-    const numB = parseInt(b.elrId.slice(4), 10);
+    var numA = parseInt(a.elrId.slice(4), 10);
+    var numB = parseInt(b.elrId.slice(4), 10);
     return numA - numB;
   });
 
@@ -240,23 +315,22 @@ function parseRegistryRows(rows) {
 }
 
 // ── Image Loading ────────────────────────────────────────
-imagesInput.addEventListener('change', e => {
+imagesInput.addEventListener('change', function(e) {
   loadImageFiles(Array.from(e.target.files));
   imagesInput.value = '';
 });
 
-// Drag-and-drop
-dropZone.addEventListener('dragenter', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
-dropZone.addEventListener('dragover',  e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
-dropZone.addEventListener('dragleave', e => { if (!dropZone.contains(e.relatedTarget)) dropZone.classList.remove('drag-over'); });
-dropZone.addEventListener('drop', e => {
+dropZone.addEventListener('dragenter', function(e) { e.preventDefault(); dropZone.classList.add('drag-over'); });
+dropZone.addEventListener('dragover',  function(e) { e.preventDefault(); dropZone.classList.add('drag-over'); });
+dropZone.addEventListener('dragleave', function(e) { if (!dropZone.contains(e.relatedTarget)) dropZone.classList.remove('drag-over'); });
+dropZone.addEventListener('drop', function(e) {
   e.preventDefault();
   dropZone.classList.remove('drag-over');
-  const files = Array.from(e.dataTransfer.files).filter(f => isImageFile(f));
+  var files = Array.from(e.dataTransfer.files).filter(function(f) { return isImageFile(f); });
   if (files.length) loadImageFiles(files);
   else setStatus('No supported image files dropped.', 'warn');
 });
-dropZone.addEventListener('click', () => imagesInput.click());
+dropZone.addEventListener('click', function() { imagesInput.click(); });
 
 function isImageFile(file) {
   return /^image\/(png|jpeg|webp|gif)$/.test(file.type) ||
@@ -266,69 +340,55 @@ function isImageFile(file) {
 function loadImageFiles(files) {
   if (!files.length) return;
 
-  const supported = files.filter(isImageFile);
-  const skipped = files.length - supported.length;
-  let added = 0;
-  let duplicates = 0;
+  var supported = files.filter(isImageFile);
+  var skipped = files.length - supported.length;
+  var added = 0;
+  var duplicates = 0;
 
-  const promises = supported.map(file => new Promise(resolve => {
-    // Deduplicate by name + size
-    const exists = state.images.some(
-      img => img.name === file.name && img.size === file.size
-    );
-    if (exists) { duplicates++; resolve(); return; }
-
-    const url = URL.createObjectURL(file);
-    const img = new Image();
-    img.onload = () => {
-      const w = img.naturalWidth;
-      const h = img.naturalHeight;
-      let orient = 'Unknown';
-      if (w > 0 && h > 0) {
-        if (w === h) orient = 'Square';
-        else if (w > h) orient = 'Landscape';
-        else orient = 'Portrait';
-      }
-      const ext = file.name.split('.').pop().toLowerCase();
-      state.images.push({
-        name: file.name,
-        size: file.size,
-        ext,
-        width: w,
-        height: h,
-        orientation: orient,
-        previewUrl: url,
-        detectedElrId: detectElrFromFilename(file.name),
+  var promises = supported.map(function(file) {
+    return new Promise(function(resolve) {
+      var exists = state.images.some(function(img) {
+        return img.name === file.name && img.size === file.size;
       });
-      added++;
-      resolve();
-    };
-    img.onerror = () => {
-      // Still add without dimensions
-      const ext = file.name.split('.').pop().toLowerCase();
-      state.images.push({
-        name: file.name,
-        size: file.size,
-        ext,
-        width: 0,
-        height: 0,
-        orientation: 'Unknown',
-        previewUrl: url,
-        detectedElrId: detectElrFromFilename(file.name),
-      });
-      added++;
-      resolve();
-    };
-    img.src = url;
-  }));
+      if (exists) { duplicates++; resolve(); return; }
 
-  Promise.all(promises).then(() => {
+      var url = URL.createObjectURL(file);
+      var imgEl = new Image();
+      var addImage = function(w, h) {
+        var orient = 'Unknown';
+        if (w > 0 && h > 0) {
+          if (w === h) orient = 'Square';
+          else if (w > h) orient = 'Landscape';
+          else orient = 'Portrait';
+        }
+        var ext = file.name.split('.').pop().toLowerCase();
+        state.images.push({
+          name: file.name,
+          size: file.size,
+          ext: ext,
+          width: w,
+          height: h,
+          orientation: orient,
+          previewUrl: url,
+          detectedElrId: detectElrFromFilename(file.name),
+          file: file,  // keep original File object for ZIP export
+        });
+        added++;
+        resolve();
+      };
+      imgEl.onload = function() { addImage(imgEl.naturalWidth, imgEl.naturalHeight); };
+      imgEl.onerror = function() { addImage(0, 0); };
+      imgEl.src = url;
+    });
+  });
+
+  Promise.all(promises).then(function() {
     renderGallery();
     updateStats();
     updateButtonStates();
-    let msg = `${added} image(s) added.`;
-    if (duplicates) msg += ` ${duplicates} duplicate(s) skipped.`;
-    if (skipped) msg += ` ${skipped} unsupported file(s) ignored.`;
+    var msg = added + ' image(s) added.';
+    if (duplicates) msg += ' ' + duplicates + ' duplicate(s) skipped.';
+    if (skipped) msg += ' ' + skipped + ' unsupported file(s) ignored.';
     setStatus(msg, added > 0 ? 'success' : 'warn');
   });
 }
@@ -338,7 +398,7 @@ function selectRow(elrId) {
   state.selectedElrId = elrId;
   renderRegistry();
   renderSelectedInfo();
-  renderGallery(); // re-render to update button states
+  renderGallery();
 }
 
 function deselectRow() {
@@ -351,14 +411,16 @@ function deselectRow() {
 deselectBtn.addEventListener('click', deselectRow);
 
 // ── Assignment State ─────────────────────────────────────
-function assignImage(elrId, imageName) {
+function assignImage(elrId, imageName, source, score, reason) {
   // Remove this image from any other ELR row
-  for (const [id, imgName] of Object.entries(state.assignments)) {
-    if (imgName === imageName && id !== elrId) {
+  for (var id in state.assignments) {
+    if (state.assignments[id] === imageName && id !== elrId) {
       delete state.assignments[id];
+      delete state.assignmentMeta[id];
     }
   }
   state.assignments[elrId] = imageName;
+  setAssignmentMeta(elrId, source || 'manual', score, reason || source || 'manual');
   renderRegistry();
   renderGallery();
   renderSelectedInfo();
@@ -368,6 +430,7 @@ function assignImage(elrId, imageName) {
 
 function clearAssignment(elrId) {
   delete state.assignments[elrId];
+  delete state.assignmentMeta[elrId];
   renderRegistry();
   renderGallery();
   renderSelectedInfo();
@@ -375,9 +438,10 @@ function clearAssignment(elrId) {
   updateButtonStates();
 }
 
-clearAssignBtn.addEventListener('click', () => {
+clearAssignBtn.addEventListener('click', function() {
   if (!Object.keys(state.assignments).length) return;
   state.assignments = {};
+  state.assignmentMeta = {};
   renderRegistry();
   renderGallery();
   renderSelectedInfo();
@@ -401,14 +465,14 @@ async function autoAssign() {
     state.visualThreshold = readVisualThreshold();
     updateVisualThresholdLabel();
 
-    let matchedByFilename = 0;
-    let matchedByVisual = 0;
+    var matchedByFilename = 0;
+    var matchedByVisual = 0;
 
     setStatus('Auto-assign step 1/2: filename match pass…', 'info');
     matchedByFilename = autoAssignByFilename();
 
-    const remainingRows = state.registry.filter(r => !state.assignments[r.elrId]);
-    const remainingImages = state.images.filter(img => !getImageAssignment(img.name));
+    var remainingRows = state.registry.filter(function(r) { return !state.assignments[r.elrId]; });
+    var remainingImages = state.images.filter(function(img) { return !getImageAssignment(img.name); });
 
     if (remainingRows.length && remainingImages.length) {
       setStatus('Auto-assign step 2/2: loading visual matching model…', 'info');
@@ -420,10 +484,10 @@ async function autoAssign() {
     renderSelectedInfo();
     updateStats();
 
-    const total = matchedByFilename + matchedByVisual;
+    var total = matchedByFilename + matchedByVisual;
     if (total > 0) {
       setStatus(
-        `Auto-assign complete: ${total} mapped (${matchedByVisual} visual, ${matchedByFilename} filename, threshold ${state.visualThreshold.toFixed(2)}).`,
+        'Auto-assign complete: ' + total + ' mapped (' + matchedByVisual + ' visual, ' + matchedByFilename + ' filename, threshold ' + state.visualThreshold.toFixed(2) + ').',
         'success'
       );
     } else {
@@ -439,51 +503,51 @@ async function autoAssign() {
 }
 
 function autoAssignByFilename() {
-  let matched = 0;
-  for (const img of state.images) {
+  var matched = 0;
+  for (var i = 0; i < state.images.length; i++) {
+    var img = state.images[i];
     if (!img.detectedElrId) continue;
-    const elrId = img.detectedElrId;
-    // Check the ELR row exists in registry
-    const rowExists = state.registry.some(r => r.elrId === elrId);
+    var elrId = img.detectedElrId;
+    var rowExists = state.registry.some(function(r) { return r.elrId === elrId; });
     if (!rowExists) continue;
-    // Only assign if row not already assigned
     if (state.assignments[elrId]) continue;
-    // Check this image is not already assigned to another row
-    const alreadyUsed = Object.values(state.assignments).includes(img.name);
+    var alreadyUsed = Object.values(state.assignments).includes(img.name);
     if (alreadyUsed) continue;
     state.assignments[elrId] = img.name;
+    setAssignmentMeta(elrId, 'filename-detected', null, 'ELR ID detected in filename');
     matched++;
   }
   return matched;
 }
 
 async function autoAssignByVisualSimilarity(candidateRows, candidateImages) {
-  const classifier = await getVisualClassifier();
+  var classifier = await getVisualClassifier();
 
-  const rowsWithPrompts = candidateRows.map(row => ({
-    row,
-    prompt: buildVisualPrompt(row),
-  }));
+  var rowsWithPrompts = candidateRows.map(function(row) {
+    return { row: row, prompt: buildVisualPrompt(row) };
+  });
 
-  const proposals = [];
-  let completed = 0;
+  var proposals = [];
+  var completed = 0;
 
-  for (const img of candidateImages) {
+  for (var i = 0; i < candidateImages.length; i++) {
+    var img = candidateImages[i];
     completed++;
     setStatus(
-      `Visual match in progress: scoring image ${completed}/${candidateImages.length}…`,
+      'Visual match in progress: scoring image ' + completed + '/' + candidateImages.length + '…',
       'info'
     );
 
-    const labels = rowsWithPrompts.map(x => x.prompt);
-    const raw = await classifier(img.previewUrl, labels, {
+    var labels = rowsWithPrompts.map(function(x) { return x.prompt; });
+    var raw = await classifier(img.previewUrl, labels, {
       topk: Math.min(5, labels.length),
     });
 
-    const predictions = Array.isArray(raw) ? raw : [];
-    for (const pred of predictions) {
+    var predictions = Array.isArray(raw) ? raw : [];
+    for (var j = 0; j < predictions.length; j++) {
+      var pred = predictions[j];
       if (!pred || typeof pred.label !== 'string' || typeof pred.score !== 'number') continue;
-      const match = rowsWithPrompts.find(x => x.prompt === pred.label);
+      var match = rowsWithPrompts.find(function(x) { return x.prompt === pred.label; });
       if (!match) continue;
       proposals.push({
         elrId: match.row.elrId,
@@ -493,19 +557,20 @@ async function autoAssignByVisualSimilarity(candidateRows, candidateImages) {
     }
   }
 
-  // Global greedy assignment with confidence floor, enforcing one-to-one mapping.
-  proposals.sort((a, b) => b.score - a.score);
-  const usedRows = new Set();
-  const usedImages = new Set();
-  let matched = 0;
+  proposals.sort(function(a, b) { return b.score - a.score; });
+  var usedRows = new Set();
+  var usedImages = new Set();
+  var matched = 0;
 
-  for (const p of proposals) {
+  for (var k = 0; k < proposals.length; k++) {
+    var p = proposals[k];
     if (p.score < state.visualThreshold) continue;
     if (state.assignments[p.elrId]) continue;
     if (getImageAssignment(p.imageName)) continue;
     if (usedRows.has(p.elrId) || usedImages.has(p.imageName)) continue;
 
     state.assignments[p.elrId] = p.imageName;
+    setAssignmentMeta(p.elrId, 'visual-analysis', p.score, 'CLIP visual similarity match');
     usedRows.add(p.elrId);
     usedImages.add(p.imageName);
     matched++;
@@ -515,7 +580,7 @@ async function autoAssignByVisualSimilarity(candidateRows, candidateImages) {
 }
 
 function buildVisualPrompt(row) {
-  const tokens = [
+  var tokens = [
     row.assetTitle,
     row.appSection,
     row.collection,
@@ -528,24 +593,49 @@ function buildVisualPrompt(row) {
     return 'fantasy game interface artwork';
   }
 
-  const compact = tokens.join(', ').replace(/\s+/g, ' ').trim();
-  // Keep prompts concise for CLIP while still descriptive.
+  var compact = tokens.join(', ').replace(/\s+/g, ' ').trim();
   return compact.slice(0, 220);
 }
 
 async function getVisualClassifier() {
   if (state.visualModelPromise) return state.visualModelPromise;
 
-  if (!window.transformers || typeof window.transformers.pipeline !== 'function') {
-    throw new Error('Visual model library not loaded. Check your internet connection and reload.');
-  }
-
-  state.visualModelPromise = window.transformers.pipeline(
+  var transformersApi = await getTransformersApi();
+  state.visualModelPromise = transformersApi.pipeline(
     'zero-shot-image-classification',
     'Xenova/clip-vit-base-patch32'
   );
 
   return state.visualModelPromise;
+}
+
+async function getTransformersApi() {
+  if (window.transformers && typeof window.transformers.pipeline === 'function') {
+    return window.transformers;
+  }
+  if (state.transformersApiPromise) return state.transformersApiPromise;
+
+  state.transformersApiPromise = (async function() {
+    var urls = [
+      'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2/+esm',
+      'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2',
+      'https://unpkg.com/@xenova/transformers@2.17.2',
+    ];
+
+    for (var i = 0; i < urls.length; i++) {
+      try {
+        var mod = await import(urls[i]);
+        if (mod && typeof mod.pipeline === 'function') return mod;
+        if (mod && mod.default && typeof mod.default.pipeline === 'function') return mod.default;
+      } catch (err) {
+        console.warn('Transformers import failed for', urls[i], err);
+      }
+    }
+
+    throw new Error('Could not load visual model library from CDN. Check internet access and reload.');
+  })();
+
+  return state.transformersApiPromise;
 }
 
 // ── Render Registry ──────────────────────────────────────
@@ -556,50 +646,46 @@ function renderRegistry() {
     return;
   }
 
-  const q = state.searchQuery.toLowerCase();
-  const filtered = q ? state.registry.filter(row => matchesSearch(row, q)) : state.registry;
-  registryCount.textContent = `(${filtered.length} of ${state.registry.length})`;
+  var q = state.searchQuery.toLowerCase();
+  var filtered = q ? state.registry.filter(function(row) { return matchesSearch(row, q); }) : state.registry;
+  registryCount.textContent = '(' + filtered.length + ' of ' + state.registry.length + ')';
 
   if (!filtered.length) {
     registryTbody.innerHTML = '<tr class="empty-row"><td colspan="6">No results for current search.</td></tr>';
     return;
   }
 
-  registryTbody.innerHTML = filtered.map(row => {
-    const assigned = state.assignments[row.elrId] || '';
-    const isSelected = row.elrId === state.selectedElrId;
-    const statusHtml = assigned
-      ? `<span class="status-badge status-mapped">Mapped</span>`
-      : `<span class="status-badge status-unmapped">Unmapped</span>`;
-    const assignedCell = assigned
-      ? `<span class="cell-truncate" title="${escHtml(assigned)}">${escHtml(assigned)}</span>`
-      : `<span style="color:var(--text-muted)">—</span>`;
+  registryTbody.innerHTML = filtered.map(function(row) {
+    var assigned = state.assignments[row.elrId] || '';
+    var isSelected = row.elrId === state.selectedElrId;
+    var statusHtml = assigned
+      ? '<span class="status-badge status-mapped">Mapped</span>'
+      : '<span class="status-badge status-unmapped">Unmapped</span>';
+    var assignedCell = assigned
+      ? '<span class="cell-truncate" title="' + escHtml(assigned) + '">' + escHtml(assigned) + '</span>'
+      : '<span style="color:var(--text-muted)">—</span>';
 
-    return `<tr class="${isSelected ? 'row-selected' : ''}" data-elr="${escHtml(row.elrId)}">
-      <td>${escHtml(row.elrId)}</td>
-      <td class="cell-truncate" title="${escHtml(row.assetTitle)}">${escHtml(row.assetTitle) || '—'}</td>
-      <td class="cell-truncate" title="${escHtml(row.appSection)}">${escHtml(row.appSection) || '—'}</td>
-      <td class="cell-truncate" title="${escHtml(row.storageFolder)}">${escHtml(row.storageFolder) || '—'}</td>
-      <td class="cell-truncate">${assignedCell}</td>
-      <td>${statusHtml}</td>
-    </tr>`;
+    return '<tr class="' + (isSelected ? 'row-selected' : '') + '" data-elr="' + escHtml(row.elrId) + '">' +
+      '<td>' + escHtml(row.elrId) + '</td>' +
+      '<td class="cell-truncate" title="' + escHtml(row.assetTitle) + '">' + (escHtml(row.assetTitle) || '—') + '</td>' +
+      '<td class="cell-truncate" title="' + escHtml(row.appSection) + '">' + (escHtml(row.appSection) || '—') + '</td>' +
+      '<td class="cell-truncate" title="' + escHtml(row.storageFolder) + '">' + (escHtml(row.storageFolder) || '—') + '</td>' +
+      '<td class="cell-truncate">' + assignedCell + '</td>' +
+      '<td>' + statusHtml + '</td>' +
+    '</tr>';
   }).join('');
 
-  // Attach click handlers
-  registryTbody.querySelectorAll('tr[data-elr]').forEach(tr => {
-    tr.addEventListener('click', () => {
-      const elrId = tr.dataset.elr;
-      if (elrId === state.selectedElrId) {
-        deselectRow();
-      } else {
-        selectRow(elrId);
-      }
+  registryTbody.querySelectorAll('tr[data-elr]').forEach(function(tr) {
+    tr.addEventListener('click', function() {
+      var elrId = tr.dataset.elr;
+      if (elrId === state.selectedElrId) deselectRow();
+      else selectRow(elrId);
     });
   });
 }
 
 function matchesSearch(row, q) {
-  const assigned = state.assignments[row.elrId] || '';
+  var assigned = state.assignments[row.elrId] || '';
   return (
     row.elrId.toLowerCase().includes(q)          ||
     row.assetTitle.toLowerCase().includes(q)      ||
@@ -617,11 +703,12 @@ function renderSelectedInfo() {
     selectedInfo.hidden = true;
     return;
   }
-  const row = state.registry.find(r => r.elrId === state.selectedElrId);
+  var row = state.registry.find(function(r) { return r.elrId === state.selectedElrId; });
   if (!row) { selectedInfo.hidden = true; return; }
 
-  const assigned = state.assignments[row.elrId] || '';
-  const fields = [
+  var assigned = state.assignments[row.elrId] || '';
+  var meta = getAssignmentMeta(row.elrId);
+  var fields = [
     { label: 'ELR ID',            value: row.elrId },
     { label: 'Asset Title',       value: row.assetTitle },
     { label: 'Collection',        value: row.collection },
@@ -631,13 +718,20 @@ function renderSelectedInfo() {
     { label: 'Orientation',       value: row.orientation },
     { label: 'Assigned Image',    value: assigned, fullWidth: true },
   ];
+  if (assigned) {
+    fields.push({ label: 'Match Source', value: meta.source });
+    fields.push({ label: 'Confidence', value: meta.confidence });
+    if (meta.score != null) {
+      fields.push({ label: 'Match Score', value: meta.score.toFixed(4) });
+    }
+  }
 
-  selectedInfoGrid.innerHTML = fields.map(f =>
-    `<div class="info-field${f.fullWidth ? ' full-width' : ''}">
-      <span class="info-label">${escHtml(f.label)}</span>
-      <span class="info-value${f.value ? '' : ' empty'}">${escHtml(f.value) || 'Not set'}</span>
-    </div>`
-  ).join('');
+  selectedInfoGrid.innerHTML = fields.map(function(f) {
+    return '<div class="info-field' + (f.fullWidth ? ' full-width' : '') + '">' +
+      '<span class="info-label">' + escHtml(f.label) + '</span>' +
+      '<span class="info-value' + (f.value ? '' : ' empty') + '">' + (escHtml(f.value) || 'Not set') + '</span>' +
+    '</div>';
+  }).join('');
 
   selectedInfo.hidden = false;
 }
@@ -650,83 +744,77 @@ function renderGallery() {
     return;
   }
 
-  galleryCount.textContent = `(${state.images.length})`;
+  galleryCount.textContent = '(' + state.images.length + ')';
 
-  galleryGrid.innerHTML = state.images.map(img => {
-    const assigned = getImageAssignment(img.name);
-    const isAssigned = !!assigned;
-    const dims = (img.width && img.height) ? `${img.width}×${img.height}` : 'unknown';
+  galleryGrid.innerHTML = state.images.map(function(img) {
+    var assigned = getImageAssignment(img.name);
+    var isAssigned = !!assigned;
+    var dims = (img.width && img.height) ? img.width + '×' + img.height : 'unknown';
 
-    const detectedTag = img.detectedElrId
-      ? `<span class="card-tag tag-elr">🔍 ${escHtml(img.detectedElrId)}</span>`
+    var detectedTag = img.detectedElrId
+      ? '<span class="card-tag tag-elr">🔍 ' + escHtml(img.detectedElrId) + '</span>'
       : '';
-    const assignedTag = isAssigned
-      ? `<span class="card-tag tag-assigned">✓ ${escHtml(assigned)}</span>`
+    var assignedTag = isAssigned
+      ? '<span class="card-tag tag-assigned">✓ ' + escHtml(assigned) + '</span>'
       : '';
 
-    const canAssign = !!state.selectedElrId;
+    var canAssign = !!state.selectedElrId;
 
-    return `<div class="image-card ${isAssigned ? 'card-assigned' : ''}" data-img="${escHtml(img.name)}">
-      <img class="card-thumb" src="${escHtml(img.previewUrl)}" alt="${escHtml(img.name)}" loading="lazy" />
-      <div class="card-body">
-        <div class="card-filename" title="${escHtml(img.name)}">${escHtml(img.name)}</div>
-        <div class="card-meta">
-          <span class="card-tag tag-dims">${escHtml(dims)}</span>
-          <span class="card-tag tag-orient">${escHtml(img.orientation)}</span>
-          ${detectedTag}
-          ${assignedTag}
-        </div>
-        <div class="card-actions">
-          <button
-            class="btn btn-sm btn-assign"
-            data-action="assign"
-            data-img="${escHtml(img.name)}"
-            ${canAssign ? '' : 'disabled'}
-            title="${canAssign ? 'Assign to selected ELR row: ' + escHtml(state.selectedElrId) : 'Select an ELR row first'}"
-          >${canAssign ? 'Assign to ' + escHtml(state.selectedElrId) : 'Select ELR row first'}</button>
-          <button
-            class="btn btn-sm btn-clear-assign"
-            data-action="clear"
-            data-img="${escHtml(img.name)}"
-            ${isAssigned ? '' : 'disabled'}
-            title="${isAssigned ? 'Remove assignment for ' + escHtml(assigned) : 'Not assigned'}"
-          >Clear assignment</button>
-        </div>
-      </div>
-    </div>`;
+    return '<div class="image-card ' + (isAssigned ? 'card-assigned' : '') + '" data-img="' + escHtml(img.name) + '">' +
+      '<img class="card-thumb" src="' + escHtml(img.previewUrl) + '" alt="' + escHtml(img.name) + '" loading="lazy" />' +
+      '<div class="card-body">' +
+        '<div class="card-filename" title="' + escHtml(img.name) + '">' + escHtml(img.name) + '</div>' +
+        '<div class="card-meta">' +
+          '<span class="card-tag tag-dims">' + escHtml(dims) + '</span>' +
+          '<span class="card-tag tag-orient">' + escHtml(img.orientation) + '</span>' +
+          detectedTag +
+          assignedTag +
+        '</div>' +
+        '<div class="card-actions">' +
+          '<button class="btn btn-sm btn-assign" data-action="assign" data-img="' + escHtml(img.name) + '"' +
+            (canAssign ? '' : ' disabled') +
+            ' title="' + (canAssign ? 'Assign to selected ELR row: ' + escHtml(state.selectedElrId) : 'Select an ELR row first') + '">' +
+            (canAssign ? 'Assign to ' + escHtml(state.selectedElrId) : 'Select ELR row first') +
+          '</button>' +
+          '<button class="btn btn-sm btn-clear-assign" data-action="clear" data-img="' + escHtml(img.name) + '"' +
+            (isAssigned ? '' : ' disabled') +
+            ' title="' + (isAssigned ? 'Remove assignment for ' + escHtml(assigned) : 'Not assigned') + '">' +
+            'Clear assignment' +
+          '</button>' +
+        '</div>' +
+      '</div>' +
+    '</div>';
   }).join('');
 
-  // Attach handlers
-  galleryGrid.querySelectorAll('button[data-action]').forEach(btn => {
-    btn.addEventListener('click', e => {
+  galleryGrid.querySelectorAll('button[data-action]').forEach(function(btn) {
+    btn.addEventListener('click', function(e) {
       e.stopPropagation();
-      const imgName = btn.dataset.img;
+      var imgName = btn.dataset.img;
       if (btn.dataset.action === 'assign') {
         if (!state.selectedElrId) { setStatus('Select an ELR row first.', 'warn'); return; }
-        assignImage(state.selectedElrId, imgName);
-        setStatus(`Assigned "${imgName}" → ${state.selectedElrId}`, 'success');
+        assignImage(state.selectedElrId, imgName, 'manual', null, 'assigned manually by user');
+        setStatus('Assigned "' + imgName + '" → ' + state.selectedElrId, 'success');
       } else if (btn.dataset.action === 'clear') {
-        const elrId = getImageAssignment(imgName);
-        if (elrId) { clearAssignment(elrId); setStatus(`Cleared assignment for ${elrId}.`, 'info'); }
+        var elrId = getImageAssignment(imgName);
+        if (elrId) { clearAssignment(elrId); setStatus('Cleared assignment for ' + elrId + '.', 'info'); }
       }
     });
   });
 }
 
-/** Returns the ELR ID this image is currently assigned to, or null */
 function getImageAssignment(imageName) {
-  for (const [id, name] of Object.entries(state.assignments)) {
-    if (name === imageName) return id;
+  for (var id in state.assignments) {
+    if (state.assignments[id] === imageName) return id;
   }
   return null;
 }
 
 // ── Stats ────────────────────────────────────────────────
 function updateStats() {
-  const total    = state.registry.length;
-  const images   = state.images.length;
-  const mapped   = Object.keys(state.assignments).length;
-  const unmapped = total - mapped;
+  var total    = state.registry.length;
+  var images   = state.images.length;
+  var mapped   = Object.keys(state.assignments).length;
+  var unmapped = total - mapped;
 
   statTotal.textContent   = total;
   statImages.textContent  = images;
@@ -736,227 +824,392 @@ function updateStats() {
 
 // ── Button States ────────────────────────────────────────
 function updateButtonStates() {
-  const hasRegistry = state.registry.length > 0;
-  const hasImages   = state.images.length > 0;
-  const hasAny      = Object.keys(state.assignments).length > 0;
-  const busy        = state.isAutoAssigning;
+  var hasRegistry = state.registry.length > 0;
+  var hasImages   = state.images.length > 0;
+  var hasAny      = Object.keys(state.assignments).length > 0;
+  var busy        = state.isAutoAssigning || state.isExporting;
 
-  autoAssignBtn.disabled    = busy || !(hasRegistry && hasImages);
-  clearAssignBtn.disabled   = !hasAny;
-  exportMappingBtn.disabled = !hasRegistry;
-  exportRenameBtn.disabled  = !hasRegistry;
-  exportWbBtn.disabled      = !(hasRegistry && state.workbookRaw);
+  autoAssignBtn.disabled       = busy || !(hasRegistry && hasImages);
+  clearAssignBtn.disabled      = !hasAny || busy;
+  exportMappingBtn.disabled    = !hasRegistry || busy;
+  exportRenameBtn.disabled     = !hasRegistry || busy;
+  exportWbBtn.disabled         = !(hasRegistry && state.workbookRaw) || busy;
+  exportAssetsZipBtn.disabled  = !hasAny || busy;
+  exportPackageZipBtn.disabled = !(hasRegistry && state.workbookRaw) || busy;
 }
 
 // ── Search ───────────────────────────────────────────────
-searchInput.addEventListener('input', () => {
+searchInput.addEventListener('input', function() {
   state.searchQuery = searchInput.value;
   renderRegistry();
 });
 
-visualThresholdInput.addEventListener('input', () => {
+visualThresholdInput.addEventListener('input', function() {
   state.visualThreshold = readVisualThreshold();
   updateVisualThresholdLabel();
 });
 
-// ── Exports ──────────────────────────────────────────────
-exportMappingBtn.addEventListener('click', () => {
+// ── Data Builders ────────────────────────────────────────
+
+function buildMappingRows() {
+  return state.registry.map(function(r) {
+    var imgName = state.assignments[r.elrId] || '';
+    var meta = getAssignmentMeta(r.elrId);
+    return {
+      elr_id: r.elrId,
+      seq: r.seq,
+      asset_title: r.assetTitle,
+      collection: r.collection,
+      app_section: r.appSection,
+      storage_folder: r.storageFolder,
+      workbook_filename: r.filename,
+      source_image_name: imgName,
+      assigned: imgName ? 'yes' : 'no',
+      match_score: imgName ? (meta.score != null ? meta.score.toFixed(4) : 'manual') : '',
+      confidence: imgName ? meta.confidence : '',
+      assignment_source: imgName ? meta.source : '',
+      match_reason: imgName ? meta.reason : '',
+    };
+  });
+}
+
+function buildRenameRows(exportedInZip) {
+  return state.registry.map(function(r) {
+    var imgName = state.assignments[r.elrId] || '';
+    var meta = getAssignmentMeta(r.elrId);
+    if (!imgName) {
+      return {
+        elr_id: r.elrId,
+        seq: r.seq,
+        asset_title: r.assetTitle,
+        source_image_name: '',
+        source_extension: '',
+        rename_to: '',
+        target_folder: r.storageFolder,
+        final_path: '',
+        confidence: '',
+        assignment_source: '',
+        match_reason: '',
+        exported_in_zip: 'no',
+      };
+    }
+    var img = state.images.find(function(i) { return i.name === imgName; });
+    var ext = img ? img.ext : imgName.split('.').pop().toLowerCase();
+    var renameTo = getTargetFilename(r, img);
+    var folder = getTargetFolder(r);
+    var finalPath = folder + '/' + renameTo;
+
+    return {
+      elr_id: r.elrId,
+      seq: r.seq,
+      asset_title: r.assetTitle,
+      source_image_name: imgName,
+      source_extension: ext,
+      rename_to: renameTo,
+      target_folder: folder,
+      final_path: finalPath,
+      confidence: meta.confidence,
+      assignment_source: meta.source,
+      match_reason: meta.reason,
+      exported_in_zip: exportedInZip ? 'yes' : 'no',
+    };
+  });
+}
+
+function buildPatchedWorkbookBlob() {
+  var wb = state.workbookRaw;
+  var SHEET_NAME = 'ELR Master Registry';
+  var ws = wb.Sheets[SHEET_NAME];
+
+  var range = XLSX.utils.decode_range(ws['!ref']);
+  var headers = {};
+  for (var c = range.s.c; c <= range.e.c; c++) {
+    var cell = ws[XLSX.utils.encode_cell({ r: range.s.r, c: c })];
+    if (cell && cell.v != null) headers[String(cell.v).trim()] = c;
+  }
+
+  var colFilename     = findColumnIndex(headers, COL_MAP.filename);
+  var colUploadStatus = findColumnIndex(headers, COL_MAP.uploadStatus);
+  var colFinalUrl     = findColumnIndex(headers, COL_MAP.finalUrl);
+  var colNotes        = findColumnIndex(headers, COL_MAP.notes);
+
+  var cloneWb = XLSX.read(
+    XLSX.write(wb, { bookType: 'xlsx', type: 'array' }),
+    { type: 'array' }
+  );
+  var targetWs = cloneWb.Sheets[SHEET_NAME];
+
+  for (var r = range.s.r + 1; r <= range.e.r; r++) {
+    var elrCell = targetWs[XLSX.utils.encode_cell({ r: r, c: findColumnIndex(headers, COL_MAP.elrId) })];
+    if (!elrCell) continue;
+    var elrId = normaliseElrId(elrCell.v);
+    if (!elrId) continue;
+    var imgName = state.assignments[elrId];
+    if (!imgName) continue;
+
+    var registryRow = state.registry.find(function(row) { return row.elrId === elrId; });
+    if (!registryRow) continue;
+
+    var img = state.images.find(function(i) { return i.name === imgName; });
+    var renameTo = getTargetFilename(registryRow, img);
+    var folder = getTargetFolder(registryRow);
+    var finalPath = '/' + folder + '/' + renameTo;
+    var meta = getAssignmentMeta(elrId);
+    var noteAppend = getAssignmentSourceLabel(meta) + ' from source image ' + imgName;
+
+    if (colFilename !== -1) setCellValue(targetWs, r, colFilename, renameTo);
+    if (colUploadStatus !== -1) setCellValue(targetWs, r, colUploadStatus, 'Mapped');
+    if (colFinalUrl !== -1) setCellValue(targetWs, r, colFinalUrl, finalPath);
+    if (colNotes !== -1) {
+      var existing = getCellValue(targetWs, r, colNotes);
+      var newNote = existing ? existing + '; ' + noteAppend : noteAppend;
+      setCellValue(targetWs, r, colNotes, newNote);
+    }
+  }
+
+  var outArray = XLSX.write(cloneWb, { bookType: 'xlsx', type: 'array' });
+  return new Blob([outArray], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+}
+
+// ── Export Event Listeners ───────────────────────────────
+exportMappingBtn.addEventListener('click', function() {
   if (!state.registry.length) { setStatus('Load a workbook first.', 'error'); return; }
   exportMappingCsv();
 });
 
-exportRenameBtn.addEventListener('click', () => {
+exportRenameBtn.addEventListener('click', function() {
   if (!state.registry.length) { setStatus('Load a workbook first.', 'error'); return; }
   exportRenameCsv();
 });
 
-exportWbBtn.addEventListener('click', () => {
+exportWbBtn.addEventListener('click', function() {
   if (!state.workbookRaw) { setStatus('Load a workbook first.', 'error'); return; }
   exportPatchedWorkbook();
 });
 
-/**
- * Export Mapping CSV
- * Fields: elr_id, seq, asset_title, collection, app_section,
- *         storage_folder, workbook_filename, source_image_name, assigned
- */
+exportAssetsZipBtn.addEventListener('click', function() {
+  if (!Object.keys(state.assignments).length) { setStatus('No assigned images to export.', 'error'); return; }
+  exportAssetsZip();
+});
+
+exportPackageZipBtn.addEventListener('click', function() {
+  if (!state.workbookRaw) { setStatus('Load a workbook first.', 'error'); return; }
+  exportCompletePackageZip();
+});
+
+// ── CSV Exports ──────────────────────────────────────────
 function exportMappingCsv() {
-  const headers = [
+  var mappingRows = buildMappingRows();
+  var headers = [
     'elr_id','seq','asset_title','collection','app_section',
-    'storage_folder','workbook_filename','source_image_name','assigned'
+    'storage_folder','workbook_filename','source_image_name','assigned',
+    'match_score','confidence','assignment_source','match_reason'
   ];
-  const rows = state.registry.map(r => {
-    const imgName = state.assignments[r.elrId] || '';
-    return [
-      r.elrId,
-      r.seq,
-      r.assetTitle,
-      r.collection,
-      r.appSection,
-      r.storageFolder,
-      r.filename,
-      imgName,
-      imgName ? 'yes' : 'no',
-    ];
-  });
-  downloadCsv([headers, ...rows], 'elr_mapping.csv');
+  var rows = mappingRows.map(function(r) { return headers.map(function(h) { return r[h]; }); });
+  downloadCsv([headers].concat(rows), 'elr_mapping.csv');
   setStatus('Mapping CSV exported.', 'success');
 }
 
-/**
- * Export Rename CSV
- * Fields: elr_id, source_image_name, rename_to, target_folder, final_path
- */
 function exportRenameCsv() {
-  const headers = [
-    'elr_id','source_image_name','rename_to','target_folder','final_path'
+  var renameRows = buildRenameRows(false);
+  var headers = [
+    'elr_id','seq','asset_title','source_image_name','source_extension',
+    'rename_to','target_folder','final_path','confidence',
+    'assignment_source','match_reason','exported_in_zip'
   ];
-  const rows = state.registry.map(r => {
-    const imgName = state.assignments[r.elrId] || '';
-    if (!imgName) {
-      return [r.elrId, '', '', r.storageFolder, ''];
-    }
-    const img = state.images.find(i => i.name === imgName);
-    const ext = img ? img.ext : imgName.split('.').pop().toLowerCase();
-
-    let renameTo = r.filename || '';
-    if (!renameTo) {
-      // Fallback: ELR_001.png style
-      const num = r.elrId.replace('ELR ', 'ELR_');
-      renameTo = `${num}.${ext}`;
-    }
-
-    const folder = r.storageFolder || '';
-    const finalPath = folder ? `/${folder}/${renameTo}` : `/${renameTo}`;
-
-    return [r.elrId, imgName, renameTo, folder, finalPath];
-  });
-  downloadCsv([headers, ...rows], 'elr_rename.csv');
-  setStatus('Rename CSV exported.', 'success');
+  var rows = renameRows.map(function(r) { return headers.map(function(h) { return r[h]; }); });
+  downloadCsv([headers].concat(rows), 'elr_rename_manifest.csv');
+  setStatus('Rename manifest CSV exported.', 'success');
 }
 
-/**
- * Export Patched Workbook
- * Clones workbook, updates rows that have assignments.
- */
 function exportPatchedWorkbook() {
   try {
-    const wb = state.workbookRaw;
-    const SHEET_NAME = 'ELR Master Registry';
-    const ws = wb.Sheets[SHEET_NAME];
-
-    // Get the range
-    const range = XLSX.utils.decode_range(ws['!ref']);
-    // Find header row (row 0)
-    const headers = {};
-    for (let c = range.s.c; c <= range.e.c; c++) {
-      const cell = ws[XLSX.utils.encode_cell({ r: range.s.r, c })];
-      if (cell && cell.v != null) headers[String(cell.v).trim()] = c;
-    }
-
-    // Column indices we'll update
-    const colFilename     = findColumnIndex(headers, COL_MAP.filename);
-    const colUploadStatus = findColumnIndex(headers, COL_MAP.uploadStatus);
-    const colFinalUrl     = findColumnIndex(headers, COL_MAP.finalUrl);
-    const colNotes        = findColumnIndex(headers, COL_MAP.notes);
-
-    // Deep-clone workbook via write/read so export edits never mutate in-memory source data.
-    const cloneWb = XLSX.read(
-      XLSX.write(wb, { bookType: 'xlsx', type: 'array' }),
-      { type: 'array' }
-    );
-    const targetWs = cloneWb.Sheets[SHEET_NAME];
-
-    // Apply patches
-    for (let r = range.s.r + 1; r <= range.e.r; r++) {
-      const elrCell = targetWs[XLSX.utils.encode_cell({ r, c: findColumnIndex(headers, COL_MAP.elrId) })];
-      if (!elrCell) continue;
-      const elrId = normaliseElrId(elrCell.v);
-      if (!elrId) continue;
-      const imgName = state.assignments[elrId];
-      if (!imgName) continue;
-
-      const registryRow = state.registry.find(row => row.elrId === elrId);
-      if (!registryRow) continue;
-
-      const img = state.images.find(i => i.name === imgName);
-      const ext = img ? img.ext : imgName.split('.').pop().toLowerCase();
-      let renameTo = registryRow.filename || '';
-      if (!renameTo) {
-        const num = elrId.replace('ELR ', 'ELR_');
-        renameTo = `${num}.${ext}`;
-      }
-      const folder = registryRow.storageFolder || '';
-      const finalPath = folder ? `/${folder}/${renameTo}` : `/${renameTo}`;
-      const noteAppend = `mapped by ELR Sorter from source image ${imgName}`;
-
-      if (colFilename !== -1) setCellValue(targetWs, r, colFilename, renameTo);
-      if (colUploadStatus !== -1) setCellValue(targetWs, r, colUploadStatus, 'Mapped');
-      if (colFinalUrl !== -1) setCellValue(targetWs, r, colFinalUrl, finalPath);
-      if (colNotes !== -1) {
-        const existing = getCellValue(targetWs, r, colNotes);
-        const newNote = existing ? `${existing}; ${noteAppend}` : noteAppend;
-        setCellValue(targetWs, r, colNotes, newNote);
-      }
-    }
-
-    // Determine output filename
-    const baseName = state.workbookFileName.replace(/\.[^.]+$/, '');
-    const outName = `${baseName}_patched.xlsx`;
-    XLSX.writeFile(cloneWb, outName);
-    setStatus(`Patched workbook exported: ${outName}`, 'success');
+    var blob = buildPatchedWorkbookBlob();
+    var baseName = state.workbookFileName.replace(/\.[^.]+$/, '');
+    var outName = baseName + '_patched.xlsx';
+    triggerDownload(blob, outName);
+    setStatus('Patched workbook exported: ' + outName, 'success');
   } catch (err) {
     setStatus('Error exporting workbook: ' + err.message, 'error');
     console.error(err);
   }
 }
 
+// ── ZIP Exports ──────────────────────────────────────────
+
+async function buildAssetsZip(zip, prefix) {
+  var assignedEntries = Object.entries(state.assignments);
+  if (!assignedEntries.length) return 0;
+
+  var addedCount = 0;
+
+  for (var i = 0; i < assignedEntries.length; i++) {
+    var elrId = assignedEntries[i][0];
+    var imgName = assignedEntries[i][1];
+    var row = state.registry.find(function(r) { return r.elrId === elrId; });
+    if (!row) continue;
+    var img = state.images.find(function(im) { return im.name === imgName; });
+    if (!img) continue;
+
+    var folder = getTargetFolder(row);
+    var filename = getTargetFilename(row, img);
+    var zipPath = prefix ? prefix + '/' + folder + '/' + filename : folder + '/' + filename;
+
+    if (img.file) {
+      zip.file(zipPath, img.file);
+    } else {
+      var resp = await fetch(img.previewUrl);
+      var blob = await resp.blob();
+      zip.file(zipPath, blob);
+    }
+    addedCount++;
+  }
+
+  return addedCount;
+}
+
+async function exportAssetsZip() {
+  if (state.isExporting) { setStatus('Export already in progress…', 'info'); return; }
+  state.isExporting = true;
+  updateButtonStates();
+
+  try {
+    setStatus('Building assets ZIP…', 'info');
+    var zip = new JSZip();
+    var count = await buildAssetsZip(zip, '');
+    if (count === 0) {
+      setStatus('No assigned images to export.', 'warn');
+      return;
+    }
+
+    setStatus('Added ' + count + ' assets to ZIP, compressing…', 'info');
+    var blob = await zip.generateAsync({ type: 'blob' }, function(meta) {
+      if (meta.percent) {
+        setStatus('Compressing ZIP: ' + Math.round(meta.percent) + '%…', 'info');
+      }
+    });
+
+    triggerDownload(blob, 'elr_renamed_assets.zip');
+    setStatus('Assets ZIP ready: ' + count + ' renamed files exported.', 'success');
+  } catch (err) {
+    setStatus('Error building assets ZIP: ' + err.message, 'error');
+    console.error(err);
+  } finally {
+    state.isExporting = false;
+    updateButtonStates();
+  }
+}
+
+async function exportCompletePackageZip() {
+  if (state.isExporting) { setStatus('Export already in progress…', 'info'); return; }
+  state.isExporting = true;
+  updateButtonStates();
+
+  try {
+    setStatus('Building complete package ZIP…', 'info');
+    var zip = new JSZip();
+
+    // 1. Renamed assets under assets/ folder
+    var assetCount = await buildAssetsZip(zip, 'assets');
+    setStatus('Added ' + assetCount + ' assets. Building CSVs…', 'info');
+
+    // 2. Mapping CSV
+    var mappingHeaders = [
+      'elr_id','seq','asset_title','collection','app_section',
+      'storage_folder','workbook_filename','source_image_name','assigned',
+      'match_score','confidence','assignment_source','match_reason'
+    ];
+    var mappingRows = buildMappingRows();
+    var mappingCsv = buildCsvString([mappingHeaders].concat(
+      mappingRows.map(function(r) { return mappingHeaders.map(function(h) { return r[h]; }); })
+    ));
+    zip.file('exports/elr_mapping.csv', mappingCsv);
+
+    // 3. Rename manifest CSV
+    var renameHeaders = [
+      'elr_id','seq','asset_title','source_image_name','source_extension',
+      'rename_to','target_folder','final_path','confidence',
+      'assignment_source','match_reason','exported_in_zip'
+    ];
+    var renameRows = buildRenameRows(true);
+    var renameCsv = buildCsvString([renameHeaders].concat(
+      renameRows.map(function(r) { return renameHeaders.map(function(h) { return r[h]; }); })
+    ));
+    zip.file('exports/elr_rename_manifest.csv', renameCsv);
+
+    // 4. Patched workbook
+    setStatus('Building patched workbook…', 'info');
+    var wbBlob = buildPatchedWorkbookBlob();
+    var baseName = state.workbookFileName.replace(/\.[^.]+$/, '');
+    zip.file('exports/' + baseName + '_patched.xlsx', wbBlob);
+
+    setStatus('Compressing complete package…', 'info');
+    var pkgBlob = await zip.generateAsync({ type: 'blob' }, function(meta) {
+      if (meta.percent) {
+        setStatus('Compressing package: ' + Math.round(meta.percent) + '%…', 'info');
+      }
+    });
+
+    triggerDownload(pkgBlob, 'elr_complete_package.zip');
+    setStatus('Complete package ready: ' + assetCount + ' assets + CSVs + patched workbook.', 'success');
+  } catch (err) {
+    setStatus('Error building complete package: ' + err.message, 'error');
+    console.error(err);
+  } finally {
+    state.isExporting = false;
+    updateButtonStates();
+  }
+}
+
+// ── Workbook Helpers ─────────────────────────────────────
 function findColumnIndex(headers, keys) {
-  for (const k of keys) {
-    if (headers[k] !== undefined) return headers[k];
+  for (var i = 0; i < keys.length; i++) {
+    if (headers[keys[i]] !== undefined) return headers[keys[i]];
   }
   return -1;
 }
 
 function setCellValue(ws, r, c, value) {
-  const addr = XLSX.utils.encode_cell({ r, c });
+  var addr = XLSX.utils.encode_cell({ r: r, c: c });
   if (!ws[addr]) ws[addr] = {};
   ws[addr].v = value;
   ws[addr].t = 's';
 }
 
 function getCellValue(ws, r, c) {
-  const addr = XLSX.utils.encode_cell({ r, c });
+  var addr = XLSX.utils.encode_cell({ r: r, c: c });
   if (!ws[addr]) return '';
   return ws[addr].v != null ? String(ws[addr].v) : '';
 }
 
 // ── CSV Helpers ──────────────────────────────────────────
-function downloadCsv(rows, filename) {
-  const content = rows.map(row =>
-    row.map(cell => {
-      const str = String(cell == null ? '' : cell);
-      // Escape cells that contain commas, quotes, or newlines
+function buildCsvString(rows) {
+  return '\uFEFF' + rows.map(function(row) {
+    return row.map(function(cell) {
+      var str = String(cell == null ? '' : cell);
       if (str.includes(',') || str.includes('"') || str.includes('\n')) {
         return '"' + str.replace(/"/g, '""') + '"';
       }
       return str;
-    }).join(',')
-  ).join('\r\n');
+    }).join(',');
+  }).join('\r\n');
+}
 
-  const blob = new Blob(['\uFEFF' + content], { type: 'text/csv;charset=utf-8;' });
+function downloadCsv(rows, filename) {
+  var content = buildCsvString(rows);
+  var blob = new Blob([content], { type: 'text/csv;charset=utf-8;' });
   triggerDownload(blob, filename);
 }
 
 function triggerDownload(blob, filename) {
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement('a');
   a.href = url;
   a.download = filename;
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
-  setTimeout(() => URL.revokeObjectURL(url), 5000);
+  setTimeout(function() { URL.revokeObjectURL(url); }, 5000);
 }
 
 // ── Utility ──────────────────────────────────────────────
